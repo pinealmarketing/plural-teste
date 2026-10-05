@@ -31,6 +31,7 @@ const form = async (url, params) =>
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams(params),
+    signal: AbortSignal.timeout(30_000),
   })).json();
 
 async function deviceLogin() {
@@ -41,6 +42,7 @@ async function deviceLogin() {
   console.log('================================================\n');
   const deadline = Date.now() + dc.expires_in * 1000;
   let wait = (dc.interval || 5) * 1000;
+  let lastBeat = Date.now();
   while (Date.now() < deadline) {
     await sleep(wait);
     const j = await form(`${LOGIN}/token`, {
@@ -48,7 +50,12 @@ async function deviceLogin() {
       client_id: CLIENT_ID,
       device_code: dc.device_code,
     });
-    if (j.access_token) return j;
+    if (j.access_token) { log('LOGIN OK', 'autenticado com sucesso'); return j; }
+    if (Date.now() - lastBeat >= 30_000) {
+      lastBeat = Date.now();
+      const min = Math.max(0, Math.round((deadline - Date.now()) / 60_000));
+      log('AGUARDANDO LOGIN', `código ${dc.user_code ?? '(veja acima)'} · expira em ~${min} min · ainda não foi digitado`);
+    }
     if (j.error === 'slow_down') wait += 5000;
     else if (j.error !== 'authorization_pending') throw new Error('Login falhou: ' + JSON.stringify(j));
   }
@@ -72,7 +79,7 @@ async function getToken() {
 
 // ---------- Graph ----------
 async function api(url, tries = 0) {
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${await getToken()}` } });
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${await getToken()}` }, signal: AbortSignal.timeout(30_000) });
   if (res.status === 401 && tries < 1) { token = null; return api(url, tries + 1); }
   if ((res.status === 429 || res.status >= 500) && tries < 3) {
     await sleep((Number(res.headers.get('retry-after')) || 2 ** tries * 2) * 1000);
@@ -104,6 +111,7 @@ const seen = new Map();      // id -> { name, etag, sha, version, missing }
 const ignored = new Set();   // para não repetir o aviso de "ignorado" a cada ciclo
 
 async function cycle() {
+  log('LENDO', `pasta "${FOLDER_PATH}" no OneDrive...`);
   const items = await listFolder();
   const ids = new Set();
   let count = 0;
