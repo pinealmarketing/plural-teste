@@ -1,6 +1,8 @@
 // Teste simples de polling de uma pasta do OneDrive via Microsoft Graph.
 // Somente leitura. Estado em memória (reiniciar = recomeça do zero).
 import { createHash } from 'node:crypto';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { dirname } from 'node:path';
 
 const {
   CLIENT_ID,
@@ -9,6 +11,7 @@ const {
   POLL_SECONDS = '30',           // de quanto em quanto tempo olha a pasta
   STABLE_SECONDS = '20',         // só processa se o arquivo estiver parado há tanto tempo
   EXTENSIONS = '.xlsx,.pdf',
+  TOKEN_FILE = '/data/token.json', // onde guardar o login (use um Volume do Railway montado em /data)
 } = process.env;
 
 const GRAPH = process.env.GRAPH_BASE || 'https://graph.microsoft.com/v1.0';
@@ -25,6 +28,28 @@ if (!CLIENT_ID) {
 
 // ---------- login (código de dispositivo) ----------
 let token = null, tokenExp = 0, refreshToken = null;
+
+async function loadSavedLogin() {
+  try {
+    refreshToken = JSON.parse(await readFile(TOKEN_FILE, 'utf8')).refreshToken || null;
+    if (refreshToken) log('SESSÃO', `login salvo encontrado em ${TOKEN_FILE}; tentando reutilizar`);
+  } catch {
+    log('SESSÃO', `nenhum login salvo em ${TOKEN_FILE}; será pedido um login novo`);
+  }
+}
+
+let warnedSave = false;
+async function saveLogin() {
+  try {
+    await mkdir(dirname(TOKEN_FILE), { recursive: true });
+    await writeFile(TOKEN_FILE, JSON.stringify({ refreshToken, savedAt: new Date().toISOString() }), { mode: 0o600 });
+  } catch (e) {
+    if (!warnedSave) {
+      warnedSave = true;
+      log('AVISO', `não consegui salvar o login em ${TOKEN_FILE} (${e.message}). Sem um Volume, o login se perde a cada reinício.`);
+    }
+  }
+}
 
 const form = async (url, params) =>
   (await fetch(url, {
@@ -72,7 +97,10 @@ async function getToken() {
   }
   if (!j?.access_token) j = await deviceLogin();
   token = j.access_token;
-  refreshToken = j.refresh_token || refreshToken;
+  if (j.refresh_token && j.refresh_token !== refreshToken) {
+    refreshToken = j.refresh_token; // a Microsoft troca o refresh token a cada uso; precisa salvar o novo
+    await saveLogin();
+  }
   tokenExp = Date.now() + j.expires_in * 1000;
   return token;
 }
@@ -164,6 +192,7 @@ async function cycle() {
   log('CICLO', `${count} arquivo(s) elegíveis na pasta, ${seen.size} conhecido(s)`);
 }
 
+await loadSavedLogin();
 log('INÍCIO', `pasta "${FOLDER_PATH}" · a cada ${POLL_SECONDS}s · estabilização ${STABLE_SECONDS}s · ${exts.join(', ')}`);
 while (true) {
   try { await cycle(); } catch (e) { log('ERRO CICLO', e.message); }
