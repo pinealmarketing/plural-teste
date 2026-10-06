@@ -1,8 +1,11 @@
-// Teste simples de polling de uma pasta do OneDrive via Microsoft Graph.
-// Somente leitura. Estado em memória (reiniciar = recomeça do zero).
+// Teste de polling de uma pasta do OneDrive via Microsoft Graph:
+// lista, baixa, EXTRAI O CONTEÚDO (.xlsx/.pdf) e move o arquivo para a subpasta "Processados".
+// Estado em memória (reiniciar = recomeça do zero).
 import { createHash } from 'node:crypto';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import ExcelJS from 'exceljs';
+import { extractText, getDocumentProxy } from 'unpdf';
 
 const {
   CLIENT_ID,
@@ -12,11 +15,14 @@ const {
   STABLE_SECONDS = '20',         // só processa se o arquivo estiver parado há tanto tempo
   EXTENSIONS = '.xlsx,.pdf',
   TOKEN_FILE = '/data/token.json', // onde guardar o login (use um Volume do Railway montado em /data)
+  PROCESSED_FOLDER = 'Processados', // subpasta dentro de FOLDER_PATH (criada se não existir)
+  MOVE_PROCESSED = 'true',          // 'false' = só extrai, não mexe nos arquivos
+  PREVIEW_CHARS = '400',            // quanto do conteúdo extraído aparece no log
 } = process.env;
 
 const GRAPH = process.env.GRAPH_BASE || 'https://graph.microsoft.com/v1.0';
 const LOGIN = process.env.LOGIN_BASE || `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0`;
-const SCOPE = 'Files.Read offline_access';
+const SCOPE = 'Files.ReadWrite offline_access'; // ReadWrite é necessário para mover
 const exts = EXTENSIONS.split(',').map((e) => e.trim().toLowerCase());
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (tag, msg) => console.log(`${new Date().toISOString().slice(11, 19)} [${tag}] ${msg}`);
@@ -106,20 +112,31 @@ async function getToken() {
 }
 
 // ---------- Graph ----------
-async function api(url, tries = 0) {
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${await getToken()}` }, signal: AbortSignal.timeout(30_000) });
-  if (res.status === 401 && tries < 1) { token = null; return api(url, tries + 1); }
+async function api(url, { method = 'GET', body, allow404 = false } = {}, tries = 0) {
+  const res = await fetch(url, {
+    method,
+    headers: {
+      Authorization: `Bearer ${await getToken()}`,
+      ...(body && { 'Content-Type': 'application/json' }),
+    },
+    body: body && JSON.stringify(body),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (res.status === 401 && tries < 1) { token = null; return api(url, { method, body, allow404 }, tries + 1); }
   if ((res.status === 429 || res.status >= 500) && tries < 3) {
     await sleep((Number(res.headers.get('retry-after')) || 2 ** tries * 2) * 1000);
-    return api(url, tries + 1);
+    return api(url, { method, body, allow404 }, tries + 1);
   }
+  if (allow404 && res.status === 404) return null;
   if (!res.ok) throw new Error(`Graph ${res.status}: ${await res.text()}`);
   return res.json();
 }
 
+const folderUrl = (path) => `${GRAPH}/me/drive/root:/${encodeURI(path.replace(/^\/+|\/+$/g, ''))}`;
+
 async function listFolder() {
   const items = [];
-  let url = `${GRAPH}/me/drive/root:/${encodeURI(FOLDER_PATH.replace(/^\/+|\/+$/g, ''))}:/children?$top=200`;
+  let url = `${folderUrl(FOLDER_PATH)}:/children?$top=200`;
   while (url) {
     const j = await api(url);
     items.push(...j.value);
@@ -132,6 +149,58 @@ async function download(item) {
   const res = await fetch(item['@microsoft.graph.downloadUrl']); // URL pré-autenticada, sem header
   if (!res.ok) throw new Error(`Download ${res.status} de ${item.name}`);
   return Buffer.from(await res.arrayBuffer());
+}
+
+// ---------- extração de conteúdo ----------
+async function extractXlsx(buf) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buf);
+  const parts = [];
+  let rows = 0;
+  wb.eachSheet((ws) => {
+    const lines = [];
+    ws.eachRow({ includeEmpty: false }, (row) => {
+      const cells = [];
+      row.eachCell({ includeEmpty: true }, (c, n) => { cells[n - 1] = c.text; });
+      lines.push(Array.from(cells, (v) => v ?? '').join('\t'));
+    });
+    rows += lines.length;
+    parts.push(`## Planilha: ${ws.name}\n${lines.join('\n')}`);
+  });
+  return { resumo: `${wb.worksheets.length} planilha(s), ${rows} linha(s)`, texto: parts.join('\n\n') };
+}
+
+async function extractPdf(buf) {
+  const pdf = await getDocumentProxy(new Uint8Array(buf));
+  const { totalPages, text } = await extractText(pdf, { mergePages: true });
+  return { resumo: `${totalPages} página(s), ${text.length} caractere(s)`, texto: text };
+}
+
+const extract = (ext, buf) => (ext === '.pdf' ? extractPdf(buf) : extractXlsx(buf));
+
+// ---------- mover para "Processados" ----------
+let processedId = null; // id da subpasta, descoberto/criado uma vez
+
+async function getProcessedFolderId(parentId) {
+  if (processedId) return processedId;
+  const path = `${FOLDER_PATH.replace(/\/+$/, '')}/${PROCESSED_FOLDER}`;
+  let f = await api(folderUrl(path), { allow404: true });
+  if (!f) {
+    f = await api(`${GRAPH}/me/drive/items/${parentId}/children`, {
+      method: 'POST',
+      body: { name: PROCESSED_FOLDER, folder: {}, '@microsoft.graph.conflictBehavior': 'fail' },
+    });
+    log('PASTA', `criada "${path}"`);
+  }
+  return (processedId = f.id);
+}
+
+async function moveToProcessed(item) {
+  const destId = await getProcessedFolderId(item.parentReference.id);
+  await api(`${GRAPH}/me/drive/items/${item.id}`, {
+    method: 'PATCH',
+    body: { parentReference: { id: destId }, '@microsoft.graph.conflictBehavior': 'rename' },
+  });
 }
 
 // ---------- polling ----------
@@ -155,7 +224,7 @@ async function cycle() {
     ids.add(it.id);
 
     const prev = seen.get(it.id);
-    if (prev && prev.etag === it.eTag && !prev.missing) continue; // nada mudou
+    if (prev && prev.etag === it.eTag && !prev.missing && prev.processed) continue; // nada mudou
 
     const idade = (Date.now() - Date.parse(it.lastModifiedDateTime)) / 1000;
     if (idade < Number(STABLE_SECONDS)) {
@@ -166,8 +235,11 @@ async function cycle() {
     try {
       const buf = await download(it);
       const sha = createHash('sha256').update(buf).digest('hex');
+      const emAndamento = prev && prev.sha === sha && !prev.processed; // extração/movimento falhou antes
 
-      if (!prev) {
+      if (emAndamento) {
+        log('RETENTATIVA', `${it.name}: reprocessando`);
+      } else if (!prev) {
         const dup = [...seen.entries()].find(([id, v]) => id !== it.id && v.sha === sha);
         seen.set(it.id, { name: it.name, etag: it.eTag, sha, version: 1 });
         if (dup) log('DUPLICADO', `${it.name} tem o mesmo conteúdo de ${dup[1].name}`);
@@ -178,8 +250,20 @@ async function cycle() {
         if (voltou) log('VOLTOU', `${it.name} reapareceu na pasta com o mesmo conteúdo`);
         else log('SÓ METADADOS', `${it.name}: eTag mudou mas o conteúdo é idêntico`);
       } else {
-        Object.assign(prev, { name: it.name, etag: it.eTag, sha, version: prev.version + 1, missing: false });
+        Object.assign(prev, { name: it.name, etag: it.eTag, sha, version: prev.version + 1, missing: false, processed: false });
         log('NOVA VERSÃO', `${it.name} agora na versão ${prev.version} (${buf.length} bytes)`);
+      }
+
+      const st = seen.get(it.id);
+      if (!st.processed) {
+        const { resumo, texto } = await extract(ext, buf);
+        log('CONTEÚDO', `${it.name}: ${resumo}`);
+        console.log(texto.slice(0, Number(PREVIEW_CHARS)).replace(/^/gm, '    | ') + (texto.length > Number(PREVIEW_CHARS) ? '\n    | …' : ''));
+        if (MOVE_PROCESSED === 'true') {
+          await moveToProcessed(it);
+          log('MOVIDO', `${it.name} -> ${PROCESSED_FOLDER}/`);
+        }
+        st.processed = true;
       }
     } catch (e) {
       log('ERRO', `${it.name}: ${e.message}`); // não atualiza o estado -> tenta de novo no próximo ciclo
@@ -187,7 +271,7 @@ async function cycle() {
   }
 
   for (const [id, v] of seen) {
-    if (!ids.has(id) && !v.missing) { v.missing = true; log('SUMIU', `${v.name} não está mais na pasta`); }
+    if (!ids.has(id) && !v.missing && !(v.processed && MOVE_PROCESSED === 'true')) { v.missing = true; log('SUMIU', `${v.name} não está mais na pasta`); }
   }
   log('CICLO', `${count} arquivo(s) elegíveis na pasta, ${seen.size} conhecido(s)`);
 }
